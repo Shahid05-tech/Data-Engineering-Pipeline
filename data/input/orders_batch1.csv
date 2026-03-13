@@ -1,3 +1,4 @@
+order_id,customer_id,product_name,unit_price,quantity,order_date
 181,81,Tablet,365,1,2026-03-28
 182,82,Headphones,92,2,2026-03-28
 183,83,Mouse,21,1,2026-03-28
@@ -8,6 +9,7 @@
 192,92,Monitor,360,1,2026-03-30
 193,93,Laptop,820,1,2026-03-30
 194,94,Phone,575,1,2026-03-30
+195,95,Tablet,380,1,2026-03-30
 195,95,Tablet,380,1,2026-03-30
 196,96,Mouse,23,2,2026-03-31
 197,97,Keyboard,56,1,2026-03-31

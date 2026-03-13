@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Tuple
+from typing import List, Tuple
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -51,19 +51,73 @@ def ensure_directories(paths: Tuple[str, ...]) -> None:
         os.makedirs(path, exist_ok=True)
 
 
-def write_delta(df: DataFrame, output_path: str, mode: str = "overwrite") -> None:
-    df.write.format("delta").mode(mode).option("overwriteSchema", "true").save(output_path)
+def write_delta(
+    df: DataFrame,
+    output_path: str,
+    mode: str = "overwrite",
+    partition_cols: list = None,
+    evolve_schema: bool = True,
+) -> None:
+    writer = df.write.format("delta").mode(mode)
+
+    # Schema Evolution happens here at Delta write-time.
+    # mergeSchema expands the Delta table schema when new columns arrive in incoming batches.
+    # Existing rows in older files remain valid and will read NULL for the newly added columns.
+    if evolve_schema:
+        writer = writer.option("mergeSchema", "true")
+    else:
+        writer = writer.option("overwriteSchema", "true")
+
+    if partition_cols:
+        writer = writer.partitionBy(*partition_cols)
+
+    writer.save(output_path)
+
+
+def _read_and_union_csv_batches(spark: SparkSession, input_path: str, logger: logging.Logger) -> DataFrame:
+    csv_pattern = os.path.join(input_path, "*.csv")
+    csv_files: List[str] = sorted(
+        f.path for f in spark.sparkContext.wholeTextFiles(csv_pattern, minPartitions=1).collect()
+    )
+
+    if not csv_files:
+        raise FileNotFoundError(f"No CSV files found at: {csv_pattern}")
+
+    logger.info("Bronze layer: discovered %s input file(s)", len(csv_files))
+
+    union_df = None
+    for file_path in csv_files:
+        batch_df = (
+            spark.read.option("header", True)
+            .option("inferSchema", True)
+            .csv(file_path)
+        )
+
+        if union_df is None:
+            union_df = batch_df
+        else:
+            # Allow new batch-specific columns (for example discount_code) to flow into Bronze.
+            # Missing columns in older batches are automatically filled with NULL by Spark.
+            union_df = union_df.unionByName(batch_df, allowMissingColumns=True)
+
+    if union_df is None:
+        raise ValueError("CSV read produced an empty DataFrame")
+
+    return union_df
 
 
 def run_bronze_layer(spark: SparkSession, input_path: str, bronze_path: str, logger: logging.Logger) -> DataFrame:
     logger.info("Bronze layer: syncing records from %s (full refresh to support removals)", input_path)
 
-    # Use batch read to ensure deletions in the source folder are reflected in the target
+    # Read each batch and union by column names so new columns can evolve safely.
+    bronze_df = _read_and_union_csv_batches(spark, input_path, logger)
+
+    # Harmonize common column aliases to keep downstream logic stable.
+    if "product_name" in bronze_df.columns and "product" not in bronze_df.columns:
+        bronze_df = bronze_df.withColumnRenamed("product_name", "product")
+
     bronze_df = (
-        spark.read.option("header", True)
-        .option("inferSchema", True)
-        .csv(os.path.join(input_path, "*.csv"))
-        .withColumn("ingestion_timestamp", F.current_timestamp())
+        bronze_df.withColumn("ingestion_timestamp", F.current_timestamp())
         .withColumn("source_file", F.input_file_name())
     )
 
@@ -81,8 +135,15 @@ def run_silver_layer(spark: SparkSession, bronze_path: str, silver_path: str, lo
     metadata_columns = {"ingestion_timestamp", "source_file", "processing_timestamp"}
     business_columns = [c for c in df.columns if c not in metadata_columns]
 
+    preferred_dedupe_keys = ["order_id", "order_date", "customer_id"]
+    dedupe_columns = [c for c in preferred_dedupe_keys if c in df.columns]
+
     logger.info("Silver layer: removing duplicate records")
-    if business_columns:
+    if dedupe_columns:
+        logger.info("Silver layer: deduplicating using key columns %s", dedupe_columns)
+        df = df.dropDuplicates(dedupe_columns)
+    elif business_columns:
+        logger.info("Silver layer: deduplicating using all business columns")
         df = df.dropDuplicates(business_columns)
     else:
         df = df.dropDuplicates()
@@ -166,8 +227,8 @@ def run_gold_layer(spark: SparkSession, silver_path: str, gold_path: str, logger
         .orderBy("order_date")
     )
 
-    logger.info("Gold layer: writing Delta table to %s", gold_path)
-    write_delta(gold_df, gold_path)
+    logger.info("Gold layer: writing Delta table to %s (partitioned by order_date)", gold_path)
+    write_delta(gold_df, gold_path, partition_cols=["order_date"])
 
     return gold_df
 
