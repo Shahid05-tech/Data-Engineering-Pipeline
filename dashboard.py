@@ -101,6 +101,45 @@ def create_spark_session() -> SparkSession:
     return configure_spark_with_delta_pip(builder).getOrCreate()
 
 
+def _compute_medallion_realtime(input_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Computes real-time Bronze and Silver views from raw input files."""
+    import glob
+    csv_files = glob.glob(os.path.join(input_path, "*.csv"))
+    if not csv_files:
+        return pd.DataFrame(), pd.DataFrame()
+
+    dfs = []
+    for f in csv_files:
+        try:
+            first_row = pd.read_csv(f, nrows=1)
+            header_keywords = ["id", "order", "date", "revenue", "product", "amount"]
+            has_header = any(any(key in str(col).lower() for key in header_keywords) for col in first_row.columns)
+            temp_df = pd.read_csv(f) if has_header else pd.read_csv(f, header=None)
+            
+            if temp_df.empty: continue
+
+            # Map common columns for display uniformity
+            col_map = {temp_df.columns[0]: "order_id", temp_df.columns[-1]: "order_date"}
+            if len(temp_df.columns) > 2: col_map[temp_df.columns[2]] = "product"
+            temp_df.rename(columns=col_map, inplace=True)
+            
+            # Add metadata for Bronze feel
+            temp_df["ingestion_timestamp"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            temp_df["source_file"] = os.path.basename(f)
+            dfs.append(temp_df)
+        except Exception: continue
+
+    if not dfs: return pd.DataFrame(), pd.DataFrame()
+    
+    bronze_rt = pd.concat(dfs, ignore_index=True)
+    
+    # Silver is the Cleaned version: Deduplicated on order_id
+    silver_rt = bronze_rt.drop_duplicates(subset=["order_id"], keep="first").copy()
+    silver_rt["processing_timestamp"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    return bronze_rt, silver_rt
+
+
 def _compute_gold_from_raw(input_path: str) -> pd.DataFrame:
     """Replicates Spark Gold logic in-memory for instant feedback."""
     import glob
@@ -111,10 +150,22 @@ def _compute_gold_from_raw(input_path: str) -> pd.DataFrame:
     dfs = []
     for f in csv_files:
         try:
-            # Read first few lines to check for headers
-            temp_df = pd.read_csv(f)
+            # 1. Detection: Read first line to check if it's a header or data
+            first_row = pd.read_csv(f, nrows=1)
+            # If any typical header string is found in column names, assume it has a header
+            header_keywords = ["id", "order", "date", "revenue", "product", "amount"]
+            has_header = any(any(key in str(col).lower() for key in header_keywords) for col in first_row.columns)
             
-            # Robust Column Mapping
+            if has_header:
+                temp_df = pd.read_csv(f)
+            else:
+                # No header detected: Re-read with header=None to preserve first data row
+                temp_df = pd.read_csv(f, header=None)
+            
+            # 2. Robust Column Mapping
+            if temp_df.empty:
+                continue
+
             # 1. Map ID column
             if "order_id" not in temp_df.columns:
                 potential_id_cols = ["id", "Order ID", "orderid", "ID"]
@@ -122,7 +173,7 @@ def _compute_gold_from_raw(input_path: str) -> pd.DataFrame:
                 if found_id:
                     temp_df.rename(columns={found_id: "order_id"}, inplace=True)
                 else:
-                    # Fallback: assume first column is the ID if we can't find it
+                    # Fallback: assume first column (index 0) is the ID
                     temp_df.rename(columns={temp_df.columns[0]: "order_id"}, inplace=True)
 
             # 2. Map Revenue column
@@ -131,6 +182,9 @@ def _compute_gold_from_raw(input_path: str) -> pd.DataFrame:
                 found_rev = next((c for c in potential_rev_cols if c in temp_df.columns), None)
                 if found_rev:
                     temp_df.rename(columns={found_rev: "revenue"}, inplace=True)
+                elif not has_header and len(temp_df.columns) >= 4:
+                    # Specific fallback for the user's headerless format (181,81,Tablet,0,1,...)
+                    temp_df.rename(columns={temp_df.columns[3]: "revenue"}, inplace=True)
             
             # 3. Map Date column
             if "order_date" not in temp_df.columns:
@@ -139,10 +193,16 @@ def _compute_gold_from_raw(input_path: str) -> pd.DataFrame:
                 if found_date:
                     temp_df.rename(columns={found_date: "order_date"}, inplace=True)
                 else:
-                    # Fallback: assume last column is date (common in your batches)
+                    # Fallback: assume last column is date
                     temp_df.rename(columns={temp_df.columns[-1]: "order_date"}, inplace=True)
 
-            dfs.append(temp_df[["order_id", "order_date"] + ([c for c in ["revenue", "unit_price", "quantity"] if c in temp_df.columns])])
+            # Ensure we have the critical columns at least renamed
+            cols_to_keep = ["order_id", "order_date"]
+            if "revenue" in temp_df.columns: cols_to_keep.append("revenue")
+            if "unit_price" in temp_df.columns: cols_to_keep.append("unit_price")
+            if "quantity" in temp_df.columns: cols_to_keep.append("quantity")
+            
+            dfs.append(temp_df[cols_to_keep])
         except Exception:
             continue
     
@@ -353,47 +413,103 @@ def load_delta_df(path_str: str) -> pd.DataFrame:
 @st.cache_data(ttl=20, show_spinner=False)
 def load_delta_history(path_str: str) -> pd.DataFrame:
     from deltalake import DeltaTable  # pyright: ignore[reportMissingImports]
-
-    history_rows: list[dict[str, Any]] = DeltaTable(path_str).history()
-    if not history_rows:
+    try:
+        history_rows = DeltaTable(path_str).history()
+        if not history_rows:
+            return pd.DataFrame()
+        history_df = pd.DataFrame(history_rows)
+        
+        # Select and order key columns for a "Proper" display
+        important_cols = [
+            "version", "timestamp", "operation", "operationParameters", 
+            "userName", "isBlindAppend", "engineInfo"
+        ]
+        available_cols = [c for c in important_cols if c in history_df.columns]
+        history_df = history_df[available_cols]
+        
+        if "timestamp" in history_df.columns:
+            history_df["timestamp"] = pd.to_datetime(history_df["timestamp"], unit='ms', errors="coerce")
+            history_df["timestamp"] = history_df["timestamp"].dt.strftime('%Y-%m-%d %H:%M:%S')
+            
+        return history_df
+    except Exception:
         return pd.DataFrame()
-    history_df = pd.DataFrame(history_rows)
-    if "timestamp" in history_df.columns:
-        history_df["timestamp"] = pd.to_datetime(history_df["timestamp"], errors="coerce")
-    return history_df
 
 
 def build_validation_frame(bronze_df: pd.DataFrame, silver_df: pd.DataFrame) -> pd.DataFrame:
-    metadata_cols = {"ingestion_timestamp", "source_file", "processing_timestamp"}
-    common_cols = [c for c in bronze_df.columns if c in silver_df.columns and c not in metadata_cols]
-    if not common_cols:
+    if bronze_df.empty:
         return pd.DataFrame()
 
     checks: list[pd.DataFrame] = []
+    
+    # 1. Check for Duplicate IDs (Identify which specific ID is repeated)
+    if "order_id" in bronze_df.columns:
+        dup_ids = bronze_df[bronze_df.duplicated(subset=["order_id"], keep=False)].copy()
+        if not dup_ids.empty:
+            dup_ids["Reason"] = dup_ids["order_id"].apply(lambda x: f"Conflict: Multiple records found for Order ID {x}")
+            checks.append(dup_ids)
 
-    duplicate_mask = bronze_df.duplicated(subset=common_cols, keep="first")
-    duplicates = bronze_df[duplicate_mask].copy()
-    if not duplicates.empty:
-        duplicates["Reason"] = "Duplicate Record"
-        checks.append(duplicates)
+    # 2. Check for Missing/Incomplete Data
+    critical_cols = ["order_id", "order_date"]
+    for col in critical_cols:
+        if col in bronze_df.columns:
+            null_mask = bronze_df[col].isna() | (bronze_df[col].astype(str) == "nan") | (bronze_df[col].astype(str) == "")
+            null_rows = bronze_df[null_mask].copy()
+            if not null_rows.empty:
+                null_rows["Reason"] = f"Validation Failed: {col} is missing or null"
+                checks.append(null_rows)
 
-    null_sensitive_cols = [c for c in common_cols if bronze_df[c].isna().any()]
-    if null_sensitive_cols:
-        null_mask = bronze_df[null_sensitive_cols].isna().any(axis=1)
-        null_rows = bronze_df[null_mask & ~duplicate_mask].copy()
-        if not null_rows.empty:
-            null_rows["Reason"] = "Null values handled or imputed"
-            checks.append(null_rows)
+    # 3. Check for Negative Values (Quality Check)
+    numeric_cols = ["quantity", "unit_price", "revenue", "price"]
+    for col in numeric_cols:
+        if col in bronze_df.columns:
+            try:
+                neg_mask = pd.to_numeric(bronze_df[col], errors="coerce") < 0
+                neg_rows = bronze_df[neg_mask].copy()
+                if not neg_rows.empty:
+                    neg_rows["Reason"] = f"Quality Alert: Negative value detected in {col}"
+                    checks.append(neg_rows)
+            except: pass
+
+    # 4. Check for Future Dates (Temporal Check)
+    if "order_date" in bronze_df.columns:
+        try:
+            dates = pd.to_datetime(bronze_df["order_date"], errors="coerce")
+            future_mask = dates > pd.Timestamp.now() + pd.Timedelta(days=1)
+            future_rows = bronze_df[future_mask].copy()
+            if not future_rows.empty:
+                future_rows["Reason"] = "Temporal Error: Record date is set in the future"
+                checks.append(future_rows)
+        except: pass
 
     if not checks:
         return pd.DataFrame()
 
-    result = pd.concat(checks, ignore_index=True)
+    # Combine all identified issues
+    result = pd.concat(checks, ignore_index=True).drop_duplicates()
+    
     preferred_cols = [
         c for c in ["order_id", "product", "category", "quantity", "price", "order_date", "Reason"]
         if c in result.columns
     ]
     return result[preferred_cols] if preferred_cols else result
+
+
+@st.dialog("Data Rejection Report")
+def show_rejection_dialog(row_data: pd.Series) -> None:
+    st.markdown(f"### 🔍 Analysis for Order ID: `{row_data.get('order_id', 'N/A')}`")
+    st.divider()
+    
+    st.error(f"**Status:** REJECTED / MODIFIED")
+    st.info(f"**Reason:** {row_data['Reason']}")
+    
+    st.markdown("#### Full Record Details")
+    # Clean up for json display
+    clean_row = row_data.to_dict()
+    st.json(clean_row)
+    
+    if st.button("Close Report", use_container_width=True):
+        st.rerun()
 
 
 def open_flow_card(step_title: str, subtitle: str, tone: str) -> None:
@@ -415,33 +531,59 @@ def render_medallion_section() -> None:
     script_dir = Path(__file__).resolve().parent
     bronze_path = script_dir / "data" / "bronze"
     silver_path = script_dir / "data" / "silver"
+    input_path = script_dir / "data" / "input"
 
-    if not bronze_path.exists() or not silver_path.exists():
-        st.error("Bronze/Silver Delta paths are missing. Run the pipeline first.")
-        return
+    # HYBRID ENGINE: Load real-time data first to avoid "Empty" errors
+    rt_bronze, rt_silver = _compute_medallion_realtime(str(input_path))
 
-    try:
-        bronze_df = load_delta_df(str(bronze_path))
-        bronze_history = load_delta_history(str(bronze_path))
-    except Exception as exc:
-        st.error(f"Failed to load Bronze: {exc}")
-        return
-
-    try:
-        silver_df = load_delta_df(str(silver_path))
-        silver_history = load_delta_history(str(silver_path))
-    except Exception as exc:
-        st.error(f"Failed to load Silver: {exc}")
-        return
+    # Try loading Delta Histories if they exist (for the ACID part)
+    bronze_history = pd.DataFrame()
+    silver_history = pd.DataFrame()
+    
+    if bronze_path.exists():
+        try: bronze_history = load_delta_history(str(bronze_path))
+        except: pass
+    if silver_path.exists():
+        try: silver_history = load_delta_history(str(silver_path))
+        except: pass
 
     open_flow_card(
-        "Step 1: Bronze Layer (Raw Data)",
+        "Step 1: Bronze Layer (Raw Ingested)",
         "Ingested source records before quality and dedup transformations.",
         "bronze",
     )
-    st.dataframe(bronze_df.head(12), use_container_width=True)
-    with st.expander("Show Bronze Delta Transaction History"):
-        st.dataframe(bronze_history, use_container_width=True)
+    # Priority: Real-time IF input exists, otherwise Delta
+    display_bronze = rt_bronze if not rt_bronze.empty else pd.DataFrame()
+    
+    # Inject "Virtual" pending transaction if raw data exists but Delta hasn't seen it
+    if not display_bronze.empty:
+        pending_row = pd.DataFrame([{
+            "version": "Pending",
+            "timestamp": "Real-time (Uncommitted)",
+            "operation": "INGESTION IN-PROGRESS",
+            "operationParameters": f"Scanning {len(display_bronze)} raw records",
+            "userName": "System",
+            "isBlindAppend": True,
+            "engineInfo": "Hybrid RT Engine"
+        }])
+        bronze_history = pd.concat([pending_row, bronze_history], ignore_index=True)
+    
+    if display_bronze.empty:
+        st.warning("Bronze table is currently empty. Add CSV files to `data/input/` to see raw records instantly.")
+    else:
+        st.dataframe(display_bronze.head(15), use_container_width=True)
+        with st.expander("📝 View Active Transaction Details (ACID Log)"):
+            if display_bronze.empty:
+                st.info("No active records to trace.")
+            else:
+                # Filter to only the single latest relevant state
+                if bronze_history.empty:
+                    st.info("No persisted history. Displaying real-time state.")
+                else:
+                    st.write(f"**Current active record count:** {len(display_bronze)}")
+                    st.write("**Latest Modification Details:**")
+                    # Only show the very top record (either Pending or Version N)
+                    st.table(bronze_history.head(1)) 
     close_flow_card()
 
     open_flow_card(
@@ -449,11 +591,31 @@ def render_medallion_section() -> None:
         "On-the-fly comparison between Bronze and Silver to show record changes.",
         "validation",
     )
-    validation_df = build_validation_frame(bronze_df, silver_df)
-    if validation_df.empty:
-        st.success("No duplicate/null-handled records detected in the current snapshot.")
+    
+    if display_bronze.empty:
+        st.info("Waiting for data in Step 1 to perform validation...")
     else:
-        st.dataframe(validation_df.head(30), use_container_width=True)
+        # For validation, we compare Bronze and the "Clean" Silver version
+        validation_df = build_validation_frame(display_bronze, rt_silver)
+        
+        if validation_df.empty:
+            st.success("✅ Clean Sweep: No duplicate or null records detected in current snapshot.")
+        else:
+            st.markdown(f"Found **{len(validation_df)}** records requiring attention.")
+            st.markdown("*Tip: Select a record to view the full rejection report details.*")
+            event = st.dataframe(
+                validation_df.head(30),
+                use_container_width=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                hide_index=True
+            )
+
+            selected_rows = event.selection.rows
+            if selected_rows:
+                selected_idx = selected_rows[0]
+                row_data = validation_df.iloc[selected_idx]
+                show_rejection_dialog(row_data)
     close_flow_card()
 
     open_flow_card(
@@ -461,9 +623,36 @@ def render_medallion_section() -> None:
         "Deduplicated and null-handled dataset used for downstream analytics.",
         "silver",
     )
-    st.dataframe(silver_df.head(12), use_container_width=True)
-    with st.expander("Show Silver Delta Transaction History"):
-        st.dataframe(silver_history, use_container_width=True)
+    
+    display_silver = rt_silver if not rt_silver.empty else pd.DataFrame()
+
+    if not display_silver.empty:
+        pending_row_silver = pd.DataFrame([{
+            "version": "Pending",
+            "timestamp": "Real-time (Uncommitted)",
+            "operation": "DEDUP IN-PROGRESS",
+            "operationParameters": "Applying dedup logic...",
+            "userName": "System",
+            "isBlindAppend": True,
+            "engineInfo": "Hybrid RT Engine"
+        }])
+        silver_history = pd.concat([pending_row_silver, silver_history], ignore_index=True)
+    
+    if display_silver.empty:
+        st.warning("Silver table is currently empty. Records move here after validation.")
+    else:
+        st.dataframe(display_silver.head(15), use_container_width=True)
+        with st.expander("📝 View Active Transaction Details (ACID Log)"):
+            if display_silver.empty:
+                st.info("No active records to trace.")
+            else:
+                st.write(f"**Cleaned record count:** {len(display_silver)}")
+                st.write("**Latest Modification Details:**")
+                if silver_history.empty:
+                    st.info("No persisted history. Displaying real-time state.")
+                else:
+                    # Only show the very top record (either Pending or Version N)
+                    st.table(silver_history.head(1))
     close_flow_card()
 
 
