@@ -448,7 +448,7 @@ def render_top_nav() -> str:
     st.markdown('<div class="top-nav-wrap"><strong>Navigation</strong></div>', unsafe_allow_html=True)
     return st.radio(
         "Select view",
-        ["Dashboard", "Bronze -> Validation -> Silver"],
+        ["Dashboard", "Bronze -> Validation -> Silver", "Quality Report"],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -481,7 +481,10 @@ def load_delta_history(path_str: str) -> pd.DataFrame:
         if "timestamp" in history_df.columns:
             history_df["timestamp"] = pd.to_datetime(history_df["timestamp"], unit='ms', errors="coerce")
             history_df["timestamp"] = history_df["timestamp"].dt.strftime('%Y-%m-%d %H:%M:%S')
-            
+
+        if "version" in history_df.columns:
+            history_df["version"] = history_df["version"].astype(str)
+
         return history_df
     except Exception:
         return pd.DataFrame()
@@ -583,6 +586,7 @@ def render_medallion_section() -> None:
     script_dir = Path(__file__).resolve().parent
     bronze_path = script_dir / "data" / "bronze"
     silver_path = script_dir / "data" / "silver"
+    quarantine_path = script_dir / "data" / "quarantine"
     input_path = script_dir / "data" / "input"
 
     # HYBRID ENGINE: Load real-time data first to avoid "Empty" errors
@@ -619,7 +623,11 @@ def render_medallion_section() -> None:
             "engineInfo": "Hybrid RT"
         }])
         bronze_history = pd.concat([pending_row, bronze_history], ignore_index=True)
-        st.dataframe(display_bronze.head(20), use_container_width=True)
+        if len(display_bronze) > 1000:
+            st.info(f"Showing top 1000 of {len(display_bronze):,} records.")
+            st.dataframe(display_bronze.head(1000), use_container_width=True)
+        else:
+            st.dataframe(display_bronze, use_container_width=True)
     else:
         st.warning("Bronze table is empty. Add data to `data/input/`.")
 
@@ -666,6 +674,45 @@ def render_medallion_section() -> None:
                 show_rejection_dialog(validation_df.iloc[event.selection.rows[0]])
     close_flow_card()
 
+    # --- STEP 2.5: QUARANTINE ---
+    open_flow_card(
+        "Step 2.5: Quarantine (Pipeline-Enforced Rejections)",
+        "Records blocked by the Spark pipeline before reaching Silver. Written to a Delta table with rejection reasons.",
+        "validation",
+    )
+    quarantine_df = pd.DataFrame()
+    if quarantine_path.exists():
+        try:
+            quarantine_df = load_delta_df(str(quarantine_path))
+        except Exception:
+            pass
+
+    if quarantine_df.empty:
+        st.info("No quarantined records yet. Run the pipeline from Airflow to enforce hard validation.")
+    else:
+        reason_col = "rejection_reason"
+        cols_q = st.columns(2)
+        with cols_q[0]:
+            st.metric("Quarantined Records", len(quarantine_df))
+        with cols_q[1]:
+            if reason_col in quarantine_df.columns:
+                breakdown = quarantine_df[reason_col].value_counts().to_dict()
+                st.metric("Distinct Rejection Reasons", len(breakdown))
+
+        if reason_col in quarantine_df.columns:
+            st.markdown("**Rejection Breakdown**")
+            breakdown_df = (
+                quarantine_df[reason_col]
+                .value_counts()
+                .rename_axis("reason")
+                .reset_index(name="count")
+            )
+            st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
+
+        st.markdown("**Rejected Records (sample)**")
+        st.dataframe(quarantine_df.head(50), use_container_width=True)
+    close_flow_card()
+
     # --- STEP 3: SILVER ---
     open_flow_card(
         "Step 3: Silver Layer (Cleaned Data)",
@@ -687,7 +734,11 @@ def render_medallion_section() -> None:
             "engineInfo": "Hybrid RT"
         }])
         silver_history = pd.concat([pending_row_silver, silver_history], ignore_index=True)
-        st.dataframe(display_silver.head(20), use_container_width=True)
+        if len(display_silver) > 1000:
+            st.info(f"Showing top 1000 of {len(display_silver):,} records.")
+            st.dataframe(display_silver.head(1000), use_container_width=True)
+        else:
+            st.dataframe(display_silver, use_container_width=True)
     else:
         st.warning("Silver table is empty. Records transition here after validation.")
 
@@ -738,25 +789,144 @@ def render_dashboard_home() -> None:
         st.warning("No data found in input folder. Please add CSV files to `data/input/`.")
         return
 
+    # --- Partition Pruning Simulation (Date Filter) ---
+    st.subheader("Simulate Partition Pruning")
+    st.markdown("Use this filter to simulate how **Partition Pruning** works. By selecting specific dates, the query only scans the relevant partitions (`order_date=YYYY-MM-DD`) instead of running a full table scan.")
+    
+    unique_dates = sorted(gold_df["date"].unique())
+    if not unique_dates:
+        st.warning("No dates found in data.")
+        return
+        
+    min_date = unique_dates[0]
+    max_date = unique_dates[-1]
+    
+    # Let user select a date range
+    selected_dates = st.date_input(
+        "Select Date Range (Simulates reading specific partition folders):",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date
+    )
+    
+    # Handle single date vs date range selection gracefully
+    if isinstance(selected_dates, tuple) and len(selected_dates) == 2:
+        start_date, end_date = selected_dates
+    elif isinstance(selected_dates, tuple) and len(selected_dates) == 1:
+        start_date = end_date = selected_dates[0]
+    else:
+        start_date = end_date = selected_dates
+        
+    filtered_df = gold_df[(gold_df["date"] >= start_date) & (gold_df["date"] <= end_date)]
+
     if "engine_notified" not in st.session_state:
         st.toast("⚡ **Ultra-Fast Real-Time Engine Active**", icon="🚀")
         st.session_state["engine_notified"] = True
 
-    total_orders = int(gold_df["total_orders"].sum())
+    total_orders = int(filtered_df["total_orders"].sum())
 
-    st.metric("Total Living Orders", f"{total_orders:,}")
+    st.metric("Total Living Orders (Filtered)", f"{total_orders:,}")
 
     st.subheader("Real-Time Daily Orders")
-    st.bar_chart(gold_df.set_index("date")["total_orders"])
+    if not filtered_df.empty:
+        st.bar_chart(filtered_df.set_index("date")["total_orders"])
+    else:
+        st.info("No orders found in the selected date range.")
 
     st.subheader("Gold Layer Dataset (Live Preview)")
-    if len(gold_df) > 1000:
-        st.info(f"Showing top 1000 of {len(gold_df):,} rows.")
-        st.dataframe(gold_df.head(1000), use_container_width=True)
+    if len(filtered_df) > 1000:
+        st.info(f"Showing top 1000 of {len(filtered_df):,} rows.")
+        st.dataframe(filtered_df.head(1000), use_container_width=True)
     else:
-        st.dataframe(gold_df, use_container_width=True)
+        st.dataframe(filtered_df, use_container_width=True)
 
     st.caption(f"Last heartbeat at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+
+def render_quality_report() -> None:
+    st.title("Data Quality & Validation Report")
+
+    script_dir = Path(__file__).resolve().parent
+    report_path = script_dir / "data" / "quality_report.json"
+
+    if not report_path.exists():
+        st.warning("No quality report found yet. Trigger a pipeline run from Airflow to generate one.")
+        st.info("Run the `daily_pyspark_pipeline` DAG in Airflow, then refresh this page.")
+        return
+
+    with open(report_path) as f:
+        report = __import__("json").load(f)
+
+    overall = report.get("overall_status", "UNKNOWN")
+    generated_at = report.get("generated_at", "")
+
+    status_color = {"PASS": "green", "WARN": "orange", "FAIL": "red"}.get(overall, "gray")
+    status_icon  = {"PASS": "✓", "WARN": "⚠", "FAIL": "✗"}.get(overall, "?")
+
+    st.markdown(
+        f"""
+        <div style="border-radius:12px; padding:1rem 1.5rem; margin-bottom:1rem;
+                    background:{'rgba(34,197,94,0.15)' if overall=='PASS' else 'rgba(249,115,22,0.15)' if overall=='WARN' else 'rgba(239,68,68,0.15)'};
+                    border:1px solid {status_color};">
+            <span style="font-size:2rem; font-weight:700; color:{status_color};">{status_icon} {overall}</span>
+            <span style="margin-left:1.5rem; color:#64748b; font-size:0.9rem;">Generated: {generated_at}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    layers = report.get("layers", [])
+
+    # ── Summary row ──────────────────────────────────────────────────────────
+    cols = st.columns(len(layers))
+    for col, layer in zip(cols, layers):
+        s = layer["status"]
+        color = {"PASS": "green", "WARN": "orange", "FAIL": "red"}.get(s, "gray")
+        icon  = {"PASS": "✓", "WARN": "⚠", "FAIL": "✗"}.get(s, "?")
+        with col:
+            st.markdown(
+                f"""<div style="border-radius:10px; padding:0.8rem; text-align:center;
+                               border:1px solid {color}; background:rgba(0,0,0,0.03);">
+                    <div style="font-size:1.4rem; font-weight:700; color:{color};">{icon} {s}</div>
+                    <div style="font-size:1.1rem; font-weight:600;">{layer['layer'].upper()}</div>
+                    <div style="color:#64748b; font-size:0.85rem;">{layer['row_count']:,} rows</div>
+                    <div style="color:#ef4444; font-size:0.8rem;">{layer['critical_failures']} critical</div>
+                    <div style="color:#f97316; font-size:0.8rem;">{layer['warnings']} warnings</div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+
+    st.divider()
+
+    # ── Per-layer check tables ────────────────────────────────────────────────
+    for layer in layers:
+        with st.expander(f"{layer['layer'].upper()} — {layer['row_count']:,} rows — {layer['status']}", expanded=True):
+            checks = layer.get("checks", [])
+            if not checks:
+                st.info("No checks recorded.")
+                continue
+
+            rows = []
+            for c in checks:
+                icon = {"PASS": "✓", "WARNING": "⚠", "CRITICAL": "✗", "WARN": "⚠"}.get(c["status"], "?")
+                rows.append({"": icon, "Check": c["name"], "Status": c["status"], "Detail": c["message"]})
+
+            df = pd.DataFrame(rows)
+
+            def _color_status(val):
+                return {
+                    "PASS":     "color: green",
+                    "WARNING":  "color: orange",
+                    "CRITICAL": "color: red; font-weight:bold",
+                }.get(val, "")
+
+            st.dataframe(
+                df.style.map(_color_status, subset=["Status"]),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.caption(f"Columns present: {', '.join(layer.get('columns', []))}")
 
 
 def render_dashboard() -> None:
@@ -765,9 +935,11 @@ def render_dashboard() -> None:
 
     if current_view == "Dashboard":
         render_dashboard_home()
-    else:
+    elif current_view == "Bronze -> Validation -> Silver":
         st.title("Medallion Flow and ACID")
         render_medallion_section()
+    else:
+        render_quality_report()
 
 
 if __name__ == "__main__":
