@@ -407,4 +407,6 @@ order_id,customer_id,product_name,unit_price,quantity,order_date
 499,399,Headphones,320,1,2026-05-30
 500,400,Monitor,580,1,2026-05-30
 500,400,Monitor,580,1,2026-05-30
-500,400,Monitor,580,1,2026-05-30,22
+501,400,Monitor,580,1,2026-05-30,22
+502,400,Monitor,580,1,2026-05-30,22
+503,380,Laptop,1230,1,2026-05-26

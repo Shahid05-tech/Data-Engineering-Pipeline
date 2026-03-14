@@ -7,8 +7,12 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 from delta import configure_spark_with_delta_pip
-from pyspark.sql import SparkSession    
+from pyspark.sql import SparkSession
 
+# Ensure project root is on sys.path so 'utils' package is always importable.
+_PROJECT_ROOT = str(Path(__file__).resolve().parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 st.set_page_config(page_title="Data Pipeline Analytics Dashboard", layout="wide")
 
@@ -929,8 +933,177 @@ def render_quality_report() -> None:
             st.caption(f"Columns present: {', '.join(layer.get('columns', []))}")
 
 
+def render_email_sidebar() -> None:
+    """Sidebar: live pipeline status banner + Resend email controls."""
+    with st.sidebar:
+
+        # ── 1. LIVE PIPELINE STATUS BANNER ───────────────────────────────────
+        st.markdown("## 🔴 Pipeline Status")
+        st.caption("Live status from last Airflow run")
+
+        pipeline_status: dict | None = None
+        try:
+            from utils.pipeline_status import read_status
+            pipeline_status = read_status()
+        except Exception:
+            pass
+
+        if pipeline_status is None:
+            st.info("ℹ️ No pipeline run recorded yet.")
+        else:
+            s        = pipeline_status.get("status", "UNKNOWN")
+            dag_id   = pipeline_status.get("dag_id", "—")
+            task_id  = pipeline_status.get("task_id", "—")
+            ts       = pipeline_status.get("timestamp", "—")
+            msg      = pipeline_status.get("message", "")
+            exc_text = pipeline_status.get("exception", "")
+            attempt  = pipeline_status.get("try_number", "—")
+
+            _color = {"SUCCESS": "#22c55e", "ERROR": "#ef4444",
+                      "RUNNING": "#3b82f6"}.get(s, "#94a3b8")
+            _icon  = {"SUCCESS": "✅", "ERROR": "❌", "RUNNING": "⏳"}.get(s, "❓")
+
+            st.markdown(
+                f"""
+                <div style="border-radius:10px; padding:10px 14px;
+                            background:{'rgba(34,197,94,0.12)'  if s=='SUCCESS' else
+                                        'rgba(239,68,68,0.12)'  if s=='ERROR'   else
+                                        'rgba(59,130,246,0.12)' if s=='RUNNING' else
+                                        'rgba(148,163,184,0.12)'};
+                            border:1.5px solid {_color}; margin-bottom:6px;">
+                    <span style="font-size:1.1rem;font-weight:700;color:{_color};">
+                        {_icon} {s}
+                    </span><br/>
+                    <span style="font-size:0.78rem;color:#64748b;">
+                        DAG: {dag_id}<br/>
+                        Task: {task_id}<br/>
+                        {'Attempt: ' + str(attempt) + '<br/>' if s == 'ERROR' else ''}
+                        At: {ts}
+                    </span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            if msg:
+                st.caption(f"📝 {msg}")
+
+            # Show full traceback when ERROR
+            if s == "ERROR" and exc_text:
+                with st.expander("🔍 View Full Error Traceback", expanded=True):
+                    st.code(exc_text, language="python")
+
+                # One-click send error report
+                api_key_q     = os.environ.get("RESEND_API_KEY", "").strip()
+                owner_email_q = os.environ.get("OWNER_EMAIL", "").strip()
+                if st.button("📨 Re-send Error Report", use_container_width=True,
+                             disabled=not (api_key_q and owner_email_q)):
+                    with st.spinner("Sending error report…"):
+                        try:
+                            from utils.notifications import send_pipeline_notification
+                            details_full = (
+                                f"DAG    : {dag_id}\n"
+                                f"Task   : {task_id}\n"
+                                f"Attempt: {attempt}\n"
+                                f"At     : {ts}\n\n"
+                                f"─── Traceback ───\n{exc_text}"
+                            )
+                            ok = send_pipeline_notification(
+                                status  = "ERROR",
+                                message = msg or f"Task '{task_id}' failed.",
+                                details = details_full,
+                            )
+                            st.success("✅ Error report sent!") if ok else st.error("❌ Failed.")
+                        except Exception as exc:
+                            st.error(f"❌ {exc}")
+
+        st.divider()
+
+        # ── 2. EMAIL CONFIG STATUS ────────────────────────────────────────────
+        st.markdown("## 📧 Email Notifications")
+        st.caption("Powered by Resend API")
+
+        try:
+            from utils.notifications import _load_env
+            _load_env()
+        except Exception:
+            pass
+
+        api_key     = os.environ.get("RESEND_API_KEY", "").strip()
+        owner_email = os.environ.get("OWNER_EMAIL", "").strip()
+
+        if api_key:
+            st.success("✅ API Key configured")
+        else:
+            st.error("❌ RESEND_API_KEY not set")
+
+        if owner_email:
+            st.info(f"📬 Alerts → `{owner_email}`")
+        else:
+            st.warning("⚠️ OWNER_EMAIL not set")
+
+        st.divider()
+
+        # ── 3. MANUAL EMAIL BUTTONS ───────────────────────────────────────────
+        _ready = bool(api_key and owner_email)
+
+        if st.button("🧪 Send Test Email", use_container_width=True, disabled=not _ready):
+            with st.spinner("Sending test email…"):
+                try:
+                    from utils.notifications import send_pipeline_notification
+                    ok = send_pipeline_notification(
+                        status  = "TEST",
+                        message = "Test alert from the Data Pipeline Dashboard.",
+                        details = (
+                            f"Dashboard is running correctly.\n"
+                            f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            f"Owner: {owner_email}"
+                        ),
+                    )
+                    st.success("✅ Test email sent!") if ok else st.error("❌ Failed.")
+                except Exception as exc:
+                    st.error(f"❌ Error: {exc}")
+
+        st.markdown("**Send Pipeline Summary**")
+        if st.button("📊 Email Current Summary", use_container_width=True, disabled=not _ready):
+            with st.spinner("Building summary and sending…"):
+                try:
+                    import glob
+                    from utils.notifications import send_pipeline_notification
+
+                    script_dir   = Path(__file__).resolve().parent
+                    input_path   = str(script_dir / "data" / "input")
+                    csv_files    = glob.glob(os.path.join(input_path, "*.csv"))
+                    raw_df       = _compute_gold_from_raw(input_path)
+                    total_orders = int(raw_df["total_orders"].sum()) if not raw_df.empty else 0
+
+                    bronze_rt, silver_rt = _compute_medallion_realtime(input_path)
+                    duplicates = max(0, len(bronze_rt) - len(silver_rt)) if not bronze_rt.empty else 0
+
+                    details = (
+                        f"Total CSV files in input  : {len(csv_files)}\n"
+                        f"Total raw records          : {len(bronze_rt) if not bronze_rt.empty else 0}\n"
+                        f"Unique (Silver) records    : {len(silver_rt) if not silver_rt.empty else 0}\n"
+                        f"Duplicate records filtered : {duplicates}\n"
+                        f"Total unique daily orders  : {total_orders}\n"
+                        f"Report generated at        : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+                    ok = send_pipeline_notification(
+                        status  = "SUCCESS",
+                        message = "Pipeline is healthy — see summary below.",
+                        details = details,
+                    )
+                    st.success("✅ Summary email sent!") if ok else st.error("❌ Failed.")
+                except Exception as exc:
+                    st.error(f"❌ Error: {exc}")
+
+        st.divider()
+        st.caption("Emails auto-send from Airflow on SUCCESS / ERROR.")
+
+
 def render_dashboard() -> None:
     inject_shared_styles()
+    render_email_sidebar()
     current_view = render_top_nav()
 
     if current_view == "Dashboard":
